@@ -1,6 +1,6 @@
 # Odoo Installer — Automated, Production-Grade Script
 
-A single bash script (`install-odoo19.sh`) that installs Odoo from source on any
+A single bash script (`install_odoo.sh`) that installs Odoo from source on any
 Debian/Ubuntu server (bare metal or AWS/Azure/GCP/DO/Hetzner cloud images).
 It is **idempotent**, **resumable**, and **resilient**: optional steps that fail
 don't abort the whole run, network operations are retried, and the script waits
@@ -10,13 +10,14 @@ for apt/dpkg locks that commonly break installers on fresh cloud VMs.
 
 | Path | Description |
 | --- | --- |
-| `install-odoo19.sh` | The installer (run with `sudo`) |
+| `install_odoo.sh` | The installer (run with `sudo`) |
 | `/etc/odoo-installer.conf` | State file, mode `0600`, holds chosen values + secrets |
 | `/etc/<service>.conf` | Odoo configuration (e.g. `/etc/odoo19.conf`) |
 | `/etc/systemd/system/<service>.service` | Versioned systemd unit (e.g. `odoo19.service`) |
 | `/etc/nginx/sites-available/<service>` | nginx vhost (only if a domain is provided) |
 | `/etc/logrotate.d/<service>` | Daily log rotation for that version's log |
 | `/var/log/odoo-installer.log` | Full installer log (every run is appended) |
+| `/usr/local/bin/<service>-regenerate-assets` | Clear asset cache + recompile CSS/JS (post-restore fix) |
 | `/usr/local/bin/<service>-install-module` | CLI module install/upgrade (no UI timeout) |
 | `/usr/local/bin/<service>-deploy-addons` | Pull custom-addon/enterprise git repos + restart |
 | `/usr/local/bin/<service>-backup` | Dump a database + filestore to `<install-dir>/backups` |
@@ -42,8 +43,8 @@ override with `--http-port` / `--gevent-port` if you like. The `odoo` system
 user and the PostgreSQL role are shared across versions.
 
 ```bash
-sudo ./install-odoo19.sh --branch 18.0 --domain erp18.example.com --tls --tls-email me@x.com
-sudo ./install-odoo19.sh --branch 19.0 --domain erp19.example.com --tls --tls-email me@x.com
+sudo ./install_odoo.sh --branch 18.0 --domain erp18.example.com --tls --tls-email me@x.com
+sudo ./install_odoo.sh --branch 19.0 --domain erp19.example.com --tls --tls-email me@x.com
 ```
 
 ## Supported environments
@@ -96,14 +97,14 @@ sudo ./install-odoo19.sh --branch 19.0 --domain erp19.example.com --tls --tls-em
 ## Quick start (interactive)
 
 ```bash
-chmod +x install-odoo19.sh
-sudo ./install-odoo19.sh
+chmod +x install_odoo.sh
+sudo ./install_odoo.sh
 ```
 
 ## Non-interactive / automated install
 
 ```bash
-sudo ./install-odoo19.sh --non-interactive --yes \
+sudo ./install_odoo.sh --non-interactive --yes \
   --domain erp.example.com \
   --branch 19.0 \
   --admin-pass 'change-me-please' \
@@ -162,6 +163,9 @@ journalctl -u odoo19.service -f
 sudo odoo19-install-module <db_name> sale_management,stock          # install
 sudo odoo19-install-module <db_name> ps_printing_press_erp --update # upgrade
 
+# Fix "Style compilation failed" after a database restore
+sudo odoo18-regenerate-assets <db_name>
+
 # Pull custom-addon / enterprise git repos and restart Odoo
 sudo odoo19-deploy-addons
 
@@ -195,7 +199,7 @@ via your Odoo contract). Three credential modes, inferred from the URL:
 **HTTPS + PAT** (best for automation):
 
 ```bash
-sudo ./install-odoo19.sh --enterprise --enterprise-token ghp_xxx
+sudo ./install_odoo.sh --enterprise --enterprise-token ghp_xxx
 ```
 
 The token is stored in `~odoo/.git-credentials` (`0600`, scoped to the host via
@@ -205,7 +209,7 @@ never written to any `.git/config` or shown in the process list.
 **SSH deploy key**:
 
 ```bash
-sudo ./install-odoo19.sh --enterprise \
+sudo ./install_odoo.sh --enterprise \
   --enterprise-repo git@github.com:odoo/enterprise.git \
   --enterprise-ssh-key /root/keys/odoo-enterprise.ed25519
 ```
@@ -253,8 +257,23 @@ Drop modules into `<install-dir>/custom-addons/`. The deploy helper handles both
   sudo systemctl start odoo19
   ```
 
-* **Module install drops the web connection**: timeout/memory limit — use
-  `sudo odoo19-install-module <db> <module>` or `--demo`.
+* **"Style compilation failed"** after install or DB restore: Odoo needs three
+  compilers — **libsass** (Python, in the venv), **lessc** (`node-less` apt
+  package), and **rtlcss** (`npm install -g rtlcss`). The installer now installs
+  all of these (v3.0.1+). On an existing server, fix and regenerate:
+
+  ```bash
+  sudo apt install -y nodejs npm node-less
+  sudo npm install -g less-plugin-clean-css rtlcss
+  lessc --version && rtlcss --version
+  sudo -u odoo /opt/odoo/18/venv/bin/python -c 'import sass; print(sass.__version__)'
+  sudo odoo18-regenerate-assets <your_db_name>
+  ```
+
+  If it still fails, check the real error:
+  `grep -iE 'asset|compile|scss|less|sass' /var/log/odoo/odoo18.log | tail -30`
+  Common after restore: broken website theme — open **Website → Configuration →
+  Themes** and re-select a theme, or upgrade the theme module from Apps.
 * **Service won't start**: `journalctl -u odoo19.service -n 100 --no-pager`.
 
 ## Contact

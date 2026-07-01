@@ -20,14 +20,14 @@
 #   - Robust wkhtmltopdf: tries multiple patched builds + deps, verifies the
 #     result, and only then falls back to the distro package.
 #
-# Usage:  sudo ./install-odoo19.sh --help
+# Usage:  sudo ./install_odoo.sh --help
 
 set -Eeuo pipefail
 
 # =============================================================================
 # Constants & defaults
 # =============================================================================
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.0.1"
 readonly STATE_FILE="/etc/odoo-installer.conf"
 readonly LEGACY_STATE_FILE="/etc/odoo_installer.conf"
 readonly DEFAULT_BASE_DIR="/opt/odoo"
@@ -668,6 +668,7 @@ apt_install() {
     libxml2-dev libxslt1-dev libssl-dev libffi-dev
     libsasl2-dev libldap2-dev libjpeg-dev zlib1g-dev libpq-dev
     postgresql postgresql-contrib
+    nodejs npm node-less
   )
   # Optional: nice-to-have or release-specific names (handled one-by-one if the
   # batch fails, so a renamed/missing package never aborts the install).
@@ -682,7 +683,6 @@ apt_install() {
     libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libgdk-pixbuf2.0-dev
     libpq-dev libmagic1
     rustc cargo
-    node-less npm nodejs
     nginx ufw rsync logrotate
     fontconfig xfonts-base xfonts-75dpi
   )
@@ -694,6 +694,41 @@ apt_install() {
   info "Installing optional packages"
   apt_install_optional "${optional_pkgs[@]}"
   ok "System packages installed."
+}
+
+# Odoo compiles web assets with:
+#   - libsass (Python, from requirements.txt) for SCSS
+#   - lessc + less-plugin-clean-css for legacy LESS bundles
+#   - rtlcss for right-to-left languages
+# Debian's node-less package supplies lessc; npm globals supply the rest.
+setup_node_assets() {
+  command -v npm >/dev/null 2>&1 || {
+    warn "npm not found; attempting to install nodejs/npm ..."
+    apt_install_optional nodejs npm node-less || {
+      warn "Could not install nodejs/npm — SCSS/LESS asset compilation may fail."
+      return 1
+    }
+  }
+
+  info "Installing Node.js asset compilers (less-plugin-clean-css, rtlcss)"
+  # Odoo's official source-install docs require these npm globals.
+  with_retries 2 npm install -g less-plugin-clean-css rtlcss >>"$LOG_FILE" 2>&1 \
+    || warn "npm global install failed; asset compilation may break for RTL/LESS."
+
+  local missing=0
+  if command -v lessc >/dev/null 2>&1; then
+    ok "lessc available: $(lessc --version 2>&1 | head -n1)"
+  else
+    warn "lessc not in PATH — install node-less or: npm install -g less"
+    missing=$((missing + 1))
+  fi
+  if command -v rtlcss >/dev/null 2>&1; then
+    ok "rtlcss available: $(rtlcss --version 2>&1 | head -n1)"
+  else
+    warn "rtlcss not in PATH — run: npm install -g rtlcss"
+    missing=$((missing + 1))
+  fi
+  [ "$missing" -eq 0 ] && ok "Node asset tooling ready." || return 1
 }
 
 _find_python() {
@@ -981,6 +1016,17 @@ setup_venv() {
     sudo -u "$DEFAULT_SYSTEM_USER" "$venv/bin/pip" install --quiet --force-reinstall 'setuptools<81' \
       || warn "Could not restore setuptools<81; Odoo may fail to start."
   fi
+
+  # libsass compiles SCSS → CSS. Without it you get "Style compilation failed".
+  if ! sudo -u "$DEFAULT_SYSTEM_USER" "$venv/bin/python" -c 'import sass' >/dev/null 2>&1; then
+    warn "libsass missing from venv; installing ..."
+    local libsass_ver="0.22.0"
+    "$venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info < (3, 11) else 1)' 2>/dev/null \
+      && libsass_ver="0.20.1"
+    sudo -u "$DEFAULT_SYSTEM_USER" "$venv/bin/pip" install --quiet "libsass==${libsass_ver}" \
+      || warn "Could not install libsass — SCSS asset compilation will fail."
+  fi
+
   ok "Python environment ready."
 }
 
@@ -1327,6 +1373,7 @@ write_helper_scripts() {
   local deploy="/usr/local/bin/${SERVICE_NAME}-deploy-addons"
   local backup="/usr/local/bin/${SERVICE_NAME}-backup"
   local instmod="/usr/local/bin/${SERVICE_NAME}-install-module"
+  local regassets="/usr/local/bin/${SERVICE_NAME}-regenerate-assets"
   info "Writing helper scripts"
 
   cat > "$deploy" <<EOF
@@ -1388,6 +1435,52 @@ echo "✓ done."
 EOF
   chmod 755 "$instmod"
 
+  cat > "$regassets" <<EOF
+#!/usr/bin/env bash
+# Regenerate web asset bundles (fixes "Style compilation failed" after a
+# database restore or when lessc/rtlcss/libsass were missing at first boot).
+set -euo pipefail
+INSTALL_DIR="${INSTALL_DIR}"
+SERVICE_NAME="${SERVICE_NAME}"
+SYSTEM_USER="${DEFAULT_SYSTEM_USER}"
+
+if [ \$# -lt 1 ]; then
+  echo "Usage: \$0 <db_name>"
+  echo "  Clears cached web assets and upgrades the 'web' module to recompile CSS/JS."
+  exit 1
+fi
+DB="\$1"
+
+echo "→ checking asset compilers"
+for cmd in lessc rtlcss; do
+  command -v "\$cmd" >/dev/null 2>&1 || { echo "✗ missing: \$cmd"; echo "  fix: sudo npm install -g rtlcss  &&  sudo apt install node-less"; exit 1; }
+done
+sudo -u "\$SYSTEM_USER" "\$INSTALL_DIR/venv/bin/python" -c 'import sass' 2>/dev/null \\
+  || { echo "✗ libsass not installed in venv"; echo "  fix: sudo -u \$SYSTEM_USER \$INSTALL_DIR/venv/bin/pip install libsass"; exit 1; }
+
+echo "→ stopping \${SERVICE_NAME}.service"
+systemctl stop "\${SERVICE_NAME}.service" || true
+
+echo "→ clearing cached asset attachments in \${DB}"
+sudo -u postgres psql -d "\$DB" -v ON_ERROR_STOP=1 -qc \\
+  "DELETE FROM ir_attachment WHERE url LIKE '/web/assets/%';"
+
+ASSET_CACHE="\${INSTALL_DIR}/data/filestore/\${DB}/assets"
+if [ -d "\$ASSET_CACHE" ]; then
+  echo "→ removing filestore asset cache"
+  rm -rf "\$ASSET_CACHE"
+fi
+
+echo "→ upgrading web module (forces SCSS/LESS recompilation)"
+sudo -u "\$SYSTEM_USER" "\$INSTALL_DIR/venv/bin/python3" "\$INSTALL_DIR/odoo/odoo-bin" \\
+  -c "/etc/\${SERVICE_NAME}.conf" -d "\$DB" -u web --stop-after-init
+
+echo "→ starting \${SERVICE_NAME}.service"
+systemctl start "\${SERVICE_NAME}.service"
+echo "✓ Asset bundles regenerated. Hard-refresh your browser (Ctrl+Shift+R)."
+EOF
+  chmod 755 "$regassets"
+
   cat > "$backup" <<EOF
 #!/usr/bin/env bash
 # Back up an Odoo database + filestore.
@@ -1414,7 +1507,7 @@ echo "✓ Backup written:"; echo "    \$DUMP"; [ -f "\$FS" ] && echo "    \$FS"
 EOF
   chmod 755 "$backup"
 
-  ok "Helpers: $deploy , $instmod , $backup"
+  ok "Helpers: $deploy , $instmod , $regassets , $backup"
 }
 
 health_check() {
@@ -1444,6 +1537,19 @@ health_check() {
   fi
 
   [ -n "$ODOO_DOMAIN" ] && systemctl is-active --quiet nginx && ok "nginx is active."
+
+  if command -v lessc >/dev/null 2>&1 && command -v rtlcss >/dev/null 2>&1; then
+    ok "Asset compilers present (lessc, rtlcss)."
+  else
+    warn "Missing lessc or rtlcss — web style compilation will fail."
+    failures=$((failures + 1))
+  fi
+  if sudo -u "$DEFAULT_SYSTEM_USER" "${INSTALL_DIR}/venv/bin/python" -c 'import sass' >/dev/null 2>&1; then
+    ok "libsass importable in venv."
+  else
+    warn "libsass not importable — SCSS compilation will fail."
+    failures=$((failures + 1))
+  fi
 
   if [ "$failures" -gt 0 ]; then
     warn "Health check found ${failures} issue(s):"
@@ -1489,6 +1595,7 @@ Useful commands:
   systemctl status ${SERVICE_NAME}.service
   journalctl -u ${SERVICE_NAME}.service -f
   ${SERVICE_NAME}-install-module <db> <module[,module]>   # CLI install (no UI timeout)
+  ${SERVICE_NAME}-regenerate-assets <db>                 # fix style/CSS errors after restore
   ${SERVICE_NAME}-deploy-addons                            # pull addons + restart
   ${SERVICE_NAME}-backup <db_name>                         # dump db + filestore
 
@@ -1523,6 +1630,7 @@ main() {
   # --- Resilient install phase -------------------------------------------
   run_step "Swap file"            optional maybe_create_swap
   run_step "System packages"      required apt_install
+  run_step "Node asset compilers" required setup_node_assets
   ensure_python                                              # sets PYTHON_BIN
   run_step "System user & dirs"   required setup_user_and_dirs
   run_step "PostgreSQL role"      required setup_postgres
